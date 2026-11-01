@@ -1,3 +1,4 @@
+import base64
 import hmac
 from html import escape as escape_html
 import json
@@ -6,8 +7,6 @@ import mimetypes
 import os
 import re
 import secrets
-import smtplib
-import ssl
 import tempfile
 import threading
 import time
@@ -17,6 +16,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from email.message import EmailMessage
+from urllib.parse import urlencode
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -243,9 +243,11 @@ def build_invitation_url(base_url):
 
 
 def send_final_status_email(rsvp):
-    smtp_user = os.environ.get("SMTP_USER")
-    smtp_password = os.environ.get("SMTP_PASSWORD")
-    if not smtp_user or not smtp_password:
+    gmail_user = os.environ.get("GMAIL_USER")
+    client_id = os.environ.get("GOOGLE_CLIENT_ID")
+    client_secret = os.environ.get("GOOGLE_CLIENT_SECRET")
+    refresh_token = os.environ.get("GOOGLE_REFRESH_TOKEN")
+    if not all((gmail_user, client_id, client_secret, refresh_token)):
         return {"sent": False, "reason": "Email notifications are not configured."}
     if not rsvp.get("email"):
         return {"sent": False, "reason": "No email address was provided for this RSVP."}
@@ -291,30 +293,60 @@ def send_final_status_email(rsvp):
     )
 
     email = EmailMessage()
-    email["From"] = os.environ.get("SMTP_FROM") or smtp_user
+    email["From"] = gmail_user
     email["To"] = rsvp["email"]
     email["Subject"] = subject
     email.set_content(message)
     email.add_alternative(html_message, subtype="html")
 
-    smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
     try:
-        smtp_port = int(os.environ.get("SMTP_PORT", "587"))
-    except ValueError:
-        LOG.error("Plus-one notification failed: SMTP_PORT must be a number.")
+        token_request = urllib.request.Request(
+            "https://oauth2.googleapis.com/token",
+            data=urlencode({
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+            }).encode("ascii"),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        with urllib.request.urlopen(token_request, timeout=15) as response:
+            token_payload = json.loads(response.read())
+        access_token = token_payload.get("access_token")
+        if not isinstance(access_token, str) or not access_token:
+            LOG.error("Gmail API token exchange returned no access token.")
+            return {
+                "sent": False,
+                "reason": "The decision was saved, but the email account could not be authorized.",
+            }
+
+        gmail_request = urllib.request.Request(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            data=json.dumps({
+                "raw": base64.urlsafe_b64encode(email.as_bytes()).decode("ascii")
+            }).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(gmail_request, timeout=15) as response:
+            if not 200 <= response.status < 300:
+                LOG.error("Gmail API returned status %s.", response.status)
+                return {
+                    "sent": False,
+                    "reason": "The decision was saved, but the email could not be sent.",
+                }
+    except urllib.error.HTTPError as error:
+        LOG.error("Gmail API request failed with HTTP status %s.", error.code)
         return {
             "sent": False,
-            "reason": "The decision was saved, but the email settings are invalid.",
+            "reason": "The decision was saved, but the email account could not send the notification.",
         }
-    try:
-        with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as smtp:
-            smtp.ehlo()
-            smtp.starttls(context=ssl.create_default_context())
-            smtp.ehlo()
-            smtp.login(smtp_user, smtp_password)
-            smtp.send_message(email)
-    except (smtplib.SMTPException, TimeoutError, OSError):
-        LOG.exception("Plus-one notification failed while sending via SMTP.")
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+        LOG.exception("Gmail API notification request failed.")
         return {
             "sent": False,
             "reason": "The decision was saved, but the email could not be sent.",
