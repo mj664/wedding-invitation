@@ -132,14 +132,15 @@ def upgrade_rsvp(rsvp):
 def write_rsvps(rsvps):
     if DATABASE_URL:
         with postgres_connection() as connection:
-            connection.execute("DELETE FROM rsvps")
-            connection.executemany(
-                "INSERT INTO rsvps (id, submitted_at, payload) VALUES (%s, %s, %s)",
-                [
-                    (rsvp["id"], rsvp.get("submittedAt", ""), postgres_json(rsvp))
-                    for rsvp in rsvps
-                ],
-            )
+            with connection.cursor() as cursor:
+                cursor.execute("DELETE FROM rsvps")
+                cursor.executemany(
+                    "INSERT INTO rsvps (id, submitted_at, payload) VALUES (%s, %s, %s)",
+                    [
+                        (rsvp["id"], rsvp.get("submittedAt", ""), postgres_json(rsvp))
+                        for rsvp in rsvps
+                    ],
+                )
         return
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
