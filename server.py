@@ -6,6 +6,8 @@ import mimetypes
 import os
 import re
 import secrets
+import smtplib
+import ssl
 import tempfile
 import threading
 import time
@@ -14,6 +16,7 @@ import urllib.request
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from email.message import EmailMessage
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -240,9 +243,9 @@ def build_invitation_url(base_url):
 
 
 def send_final_status_email(rsvp):
-    api_key = os.environ.get("RESEND_API_KEY")
-    sender = os.environ.get("RESEND_FROM")
-    if not api_key or not sender:
+    smtp_user = os.environ.get("SMTP_USER")
+    smtp_password = os.environ.get("SMTP_PASSWORD")
+    if not smtp_user or not smtp_password:
         return {"sent": False, "reason": "Email notifications are not configured."}
     if not rsvp.get("email"):
         return {"sent": False, "reason": "No email address was provided for this RSVP."}
@@ -287,34 +290,31 @@ def send_final_status_email(rsvp):
         f'<p><a href="{escape_html(invitation_url, quote=True)}">Open your invitation</a></p>'
     )
 
-    payload = json.dumps({
-        "from": sender,
-        "to": [rsvp["email"]],
-        "subject": subject,
-        "text": message,
-        "html": html_message,
-    }).encode("utf-8")
-    request = urllib.request.Request(
-        "https://api.resend.com/emails",
-        data=payload,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
+    email = EmailMessage()
+    email["From"] = os.environ.get("SMTP_FROM") or smtp_user
+    email["To"] = rsvp["email"]
+    email["Subject"] = subject
+    email.set_content(message)
+    email.add_alternative(html_message, subtype="html")
+
+    smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
     try:
-        with urllib.request.urlopen(request, timeout=15) as response:
-            if not 200 <= response.status < 300:
-                raise RuntimeError(f"Email provider returned status {response.status}.")
-    except urllib.error.HTTPError as error:
-        LOG.error("Plus-one notification failed: email provider returned status %s.", error.code)
+        smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+    except ValueError:
+        LOG.error("Plus-one notification failed: SMTP_PORT must be a number.")
         return {
             "sent": False,
-            "reason": "The decision was saved, but the email could not be sent.",
+            "reason": "The decision was saved, but the email settings are invalid.",
         }
-    except (urllib.error.URLError, TimeoutError, OSError) as error:
-        LOG.error("Plus-one notification failed: %s", error)
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as smtp:
+            smtp.ehlo()
+            smtp.starttls(context=ssl.create_default_context())
+            smtp.ehlo()
+            smtp.login(smtp_user, smtp_password)
+            smtp.send_message(email)
+    except (smtplib.SMTPException, TimeoutError, OSError):
+        LOG.exception("Plus-one notification failed while sending via SMTP.")
         return {
             "sent": False,
             "reason": "The decision was saved, but the email could not be sent.",
