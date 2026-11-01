@@ -12,6 +12,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,6 +24,7 @@ ROOT = Path(__file__).resolve().parent
 PUBLIC_DIR = ROOT / "public"
 DATA_DIR = ROOT / "data"
 RSVP_FILE = DATA_DIR / "rsvps.json"
+DATABASE_URL = os.environ.get("DATABASE_URL")
 PORT = int(os.environ.get("PORT", "8080"))
 HOST = os.environ.get("HOST", "0.0.0.0")
 SESSION_LIFETIME = 8 * 60 * 60
@@ -42,6 +44,32 @@ class RequestError(Exception):
         self.status = status
 
 
+class StorageError(Exception):
+    pass
+
+
+@contextmanager
+def postgres_connection():
+    try:
+        import psycopg
+    except ImportError as error:
+        raise StorageError("PostgreSQL support is missing. Install the project requirements.") from error
+
+    try:
+        with psycopg.connect(DATABASE_URL, connect_timeout=10) as connection:
+            yield connection
+    except psycopg.Error as error:
+        raise StorageError("Could not complete the RSVP database operation.") from error
+
+
+def postgres_json(value):
+    try:
+        from psycopg.types.json import Jsonb
+    except ImportError as error:
+        raise StorageError("PostgreSQL support is missing. Install the project requirements.") from error
+    return Jsonb(value)
+
+
 def json_response(handler, status, payload, extra_headers=None):
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     handler.send_response(status)
@@ -56,6 +84,15 @@ def json_response(handler, status, payload, extra_headers=None):
 
 
 def read_rsvps():
+    if DATABASE_URL:
+        with postgres_connection() as connection:
+            rows = connection.execute(
+                "SELECT payload FROM rsvps ORDER BY submitted_at, id"
+            ).fetchall()
+        return [upgrade_rsvp(row[0]) for row in rows]
+
+    if not RSVP_FILE.exists():
+        return []
     with RSVP_FILE.open("r", encoding="utf-8") as rsvp_file:
         return [upgrade_rsvp(rsvp) for rsvp in json.load(rsvp_file)]
 
@@ -93,6 +130,19 @@ def upgrade_rsvp(rsvp):
 
 
 def write_rsvps(rsvps):
+    if DATABASE_URL:
+        with postgres_connection() as connection:
+            connection.execute("DELETE FROM rsvps")
+            connection.executemany(
+                "INSERT INTO rsvps (id, submitted_at, payload) VALUES (%s, %s, %s)",
+                [
+                    (rsvp["id"], rsvp.get("submittedAt", ""), postgres_json(rsvp))
+                    for rsvp in rsvps
+                ],
+            )
+        return
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     temporary_path = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -304,7 +354,7 @@ class WeddingRequestHandler(BaseHTTPRequestHandler):
         if route == "/api/admin/rsvps":
             try:
                 json_response(self, 200, {"rsvps": read_rsvps()})
-            except (OSError, json.JSONDecodeError):
+            except (OSError, json.JSONDecodeError, StorageError):
                 LOG.exception("Could not read RSVP records.")
                 json_response(self, 500, {"error": "The guest list could not be loaded."})
             return
@@ -330,7 +380,7 @@ class WeddingRequestHandler(BaseHTTPRequestHandler):
                     rsvps = read_rsvps()
                     rsvps.append(rsvp)
                     write_rsvps(rsvps)
-            except (OSError, json.JSONDecodeError):
+            except (OSError, json.JSONDecodeError, StorageError):
                 LOG.exception("Could not save RSVP.")
                 json_response(self, 500, {"error": "Your RSVP could not be saved. Please try again."})
                 return
@@ -442,7 +492,7 @@ class WeddingRequestHandler(BaseHTTPRequestHandler):
                 rsvp["reviewedAt"] = datetime.now(timezone.utc).isoformat()
                 write_rsvps(rsvps)
                 reviewed_rsvp = dict(rsvp)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError, StorageError):
             LOG.exception("Could not save plus-one decision.")
             json_response(self, 500, {"error": "The decision could not be saved."})
             return
@@ -472,7 +522,7 @@ class WeddingRequestHandler(BaseHTTPRequestHandler):
                     json_response(self, 404, {"error": "That RSVP could not be found."})
                     return
                 write_rsvps(remaining)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError, StorageError):
             LOG.exception("Could not delete RSVP.")
             json_response(self, 500, {"error": "The RSVP could not be deleted."})
             return
@@ -573,6 +623,20 @@ class WeddingRequestHandler(BaseHTTPRequestHandler):
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    if DATABASE_URL:
+        with postgres_connection() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS rsvps (
+                    id TEXT PRIMARY KEY,
+                    submitted_at TEXT NOT NULL,
+                    payload JSONB NOT NULL
+                )
+                """
+            )
+        LOG.info("Using PostgreSQL for RSVP storage.")
+    else:
+        LOG.info("DATABASE_URL is not set; using the local RSVP file.")
     server = ThreadingHTTPServer((HOST, PORT), WeddingRequestHandler)
     LOG.info("Wedding invitation ready at http://localhost:%s", PORT)
     try:
